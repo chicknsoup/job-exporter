@@ -3,13 +3,20 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"github.com/gojektech/heimdall/httpclient"
+	"fmt"
+	"github.com/PuerkitoBio/goquery"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/shirou/gopsutil/process"
 	"io/ioutil"
+	"job-exporter/overseer"
 	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 type SparkJson struct {
@@ -33,6 +40,14 @@ type SparkApp struct {
 	RunningContainers      int64   `json:"runningContainers"`
 	QueueUsagePercentage   float64 `json:"queueUsagePercentage"`
 	ClusterUsagePercentage float64 `json:"clusterUsagePercentage"`
+}
+
+type StreamingStats struct {
+	App             *SparkApp
+	CompletedBaches int64
+	LastBatchID     string
+	BatchInput      int64
+	BatchDuration   int64
 }
 
 type StormJson struct {
@@ -78,22 +93,33 @@ type collector struct {
 	scrapeFailures        *prometheus.Desc
 	failureCount          int
 	appMetrics            map[string]*prometheus.GaugeVec
+	client                *http.Client
 }
 
 const (
-	yarnNamespace  = "yarn"
-	metricAPI      = "/ws/v1/cluster/metrics"
-	runningAppAPI  = "/ws/v1/cluster/apps?state=RUNNING"
-	stormNamespace = "storm"
-	stormAPI       = "/api/v1/topology/summary"
+	yarnNamespace          = "yarn"
+	metricAPI              = "/ws/v1/cluster/metrics"
+	runningAppAPI          = "/ws/v1/cluster/apps?state=RUNNING"
+	stormNamespace         = "storm"
+	stormAPI               = "/api/v1/topology/summary"
+	streamingStatsEndpoint = "/streaming/statistics" //proxy/app_id/streaming/statistics
 )
+
+var (
+	is_restarting bool
+)
+
+func SetRestartState(state bool) {
+	is_restarting = state
+}
 
 func newFuncMetric(metricName string, docString string, labels []string) *prometheus.Desc {
 	return prometheus.NewDesc(prometheus.BuildFQName(yarnNamespace, "", metricName), docString, labels, nil)
 }
 
-func YarnCollector(servers string, storms string) *collector {
+func YarnCollector(client *http.Client, servers string, storms string) *collector {
 	appmetrics := map[string]*prometheus.GaugeVec{}
+
 	return &collector{
 		yarnServers:           servers,
 		stormServers:          storms,
@@ -124,6 +150,7 @@ func YarnCollector(servers string, storms string) *collector {
 		nodesActive:           newFuncMetric("nodes_active", "Nodes active", []string{"yarn_instance"}),
 		scrapeFailures:        newFuncMetric("scrape_failures_total", "Number of errors while scraping YARN metrics", []string{"yarn_instance"}),
 		appMetrics:            appmetrics,
+		client:                client,
 	}
 }
 
@@ -166,7 +193,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		for _, server := range servers {
 			up := 1.0
 			//url:=
-			data, err := fetch(server + metricAPI)
+			data, err := c.fetch(server + metricAPI)
 			if err != nil {
 				up = 0.0
 				c.failureCount++
@@ -212,13 +239,42 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	return
 }
 
+func (c *collector) getAppMetrics(server string, app SparkApp, ch chan<- *StreamingStats, wg *sync.WaitGroup) {
+	defer wg.Done()
+	stats, e := c.fetchSparkJobStat(server, app)
+
+	if e != nil {
+		log.Println("Failed to fetch streaming stats for appid=" + app.Id)
+		stats = nil
+	}
+	ch <- stats
+}
+
 func (c *collector) scrape() {
 
+	pid := os.Getpid()
+	//fmt.Println(pid)
+	proc, err := process.NewProcess(int32(pid))
+	if err == nil {
+		meminfo, _ := proc.MemoryInfoEx()
+		//auto restart
+		if meminfo != nil {
+			if (meminfo.RSS > memlimit) {
+				if !is_restarting {
+					fmt.Println(fmt.Sprintf("job exporter is restarting due to mem limit reached, current value = (  %.6f MB)", meminfo.RSS/1024/1024))
+					overseer.Restart()
+					SetRestartState(true)
+				}
+			}
+		}
+	}
+
 	if c.yarnServers != "" {
+
 		servers := strings.Split(c.yarnServers, ",")
 		for _, server := range servers {
 			uri := server + runningAppAPI
-			data, er := fetchJson(uri)
+			data, er := c.fetchJson(uri)
 			c.Lock()
 			c.appMetrics[server] = prometheus.NewGaugeVec(
 				prometheus.GaugeOpts{
@@ -251,6 +307,9 @@ func (c *collector) scrape() {
 					continue
 				}
 
+				ch := make(chan *StreamingStats)
+				var wg sync.WaitGroup
+
 				for _, app := range apps {
 					c.Lock()
 					c.appMetrics[app.Id] = prometheus.NewGaugeVec(
@@ -282,6 +341,26 @@ func (c *collector) scrape() {
 
 					c.Unlock()
 
+					wg.Add(1)
+
+					go c.getAppMetrics(server, app, ch, &wg)
+				}
+				// close the channel in the background
+				go func() {
+					wg.Wait()
+					close(ch)
+				}()
+
+				for res := range ch {
+					//log.Println(res.App.Id)
+					if res != nil {
+						c.Lock()
+						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "last_streaming_batch_input"}).Set(float64(res.BatchInput))
+						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "last_streaming_batch_duration_seconds"}).Set(float64(res.BatchDuration))
+						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "total_completed_batches"}).Set(float64(res.CompletedBaches))
+
+						c.Unlock()
+					}
 				}
 			}
 
@@ -292,7 +371,7 @@ func (c *collector) scrape() {
 		servers := strings.Split(c.stormServers, ",")
 		for _, server := range servers {
 			uri := (server + stormAPI)
-			data, e := fetchJson(uri)
+			data, e := c.fetchJson(uri)
 			c.Lock()
 			c.appMetrics[server] = prometheus.NewGaugeVec(
 				prometheus.GaugeOpts{
@@ -336,13 +415,14 @@ func (c *collector) scrape() {
 						"name",
 						"owner",
 						"status",
+						"storm_instance",
 						"metric",
 					},
 				)
 
-				c.appMetrics[app.TopoName].With(prometheus.Labels{"name": app.TopoName, "owner": app.Owner, "status": app.Status, "metric": "up"}).Set(1)
-				c.appMetrics[app.TopoName].With(prometheus.Labels{"name": app.TopoName, "owner": app.Owner, "status": app.Status, "metric": "assigned_total_mem"}).Set(float64(app.AssignedTotalMem))
-				c.appMetrics[app.TopoName].With(prometheus.Labels{"name": app.TopoName, "owner": app.Owner, "status": app.Status, "metric": "uptime_seconds"}).Set(float64(app.Uptime))
+				c.appMetrics[app.TopoName].With(prometheus.Labels{"name": app.TopoName, "owner": app.Owner, "status": app.Status, "storm_instance": server, "metric": "up"}).Set(1)
+				c.appMetrics[app.TopoName].With(prometheus.Labels{"name": app.TopoName, "owner": app.Owner, "status": app.Status, "storm_instance": server, "metric": "assigned_total_mem"}).Set(float64(app.AssignedTotalMem))
+				c.appMetrics[app.TopoName].With(prometheus.Labels{"name": app.TopoName, "owner": app.Owner, "status": app.Status, "storm_instance": server, "metric": "uptime_seconds"}).Set(float64(app.Uptime))
 
 				c.Unlock()
 
@@ -353,7 +433,8 @@ func (c *collector) scrape() {
 
 }
 
-func fetchSparkJobs(body []byte) ([]SparkApp, error) {
+func
+fetchSparkJobs(body []byte) ([]SparkApp, error) {
 	var p SparkJson
 	err := json.Unmarshal(body, &p)
 	if err != nil {
@@ -364,7 +445,8 @@ func fetchSparkJobs(body []byte) ([]SparkApp, error) {
 	return p.Apps.SparkApps, nil
 }
 
-func fetchStormJobs(body []byte) ([]StormApp, error) {
+func
+fetchStormJobs(body []byte) ([]StormApp, error) {
 	var p StormJson
 	err := json.Unmarshal(body, &p)
 	if err != nil {
@@ -375,10 +457,10 @@ func fetchStormJobs(body []byte) ([]StormApp, error) {
 	return p.StormApps, nil
 }
 
-func fetchJson(url string) ([]byte, error) {
-	timeout := 5000 * time.Millisecond
-	client := httpclient.NewClient(httpclient.WithHTTPTimeout(timeout))
-	resp, e := client.Get(url, nil)
+func (c *collector) fetchJson(url string) ([]byte, error) {
+	//timeout := 5000 * time.Millisecond
+	//client := httpclient.NewClient(httpclient.WithHTTPTimeout(timeout))
+	resp, e := c.client.Get(url)
 
 	if e != nil {
 		log.Println(e.Error())
@@ -400,11 +482,11 @@ func fetchJson(url string) ([]byte, error) {
 	return body, nil
 }
 
-func fetch(url string) (map[string]map[string]float64, error) {
+func (c *collector) fetch(url string) (map[string]map[string]float64, error) {
 
-	timeout := 5000 * time.Millisecond
-	client := httpclient.NewClient(httpclient.WithHTTPTimeout(timeout))
-	resp, err := client.Get(url, nil)
+	//timeout := 5000 * time.Millisecond
+	//client := httpclient.NewClient(httpclient.WithHTTPTimeout(timeout))
+	resp, err := c.client.Get(url)
 
 	if err != nil {
 		return nil, err
@@ -431,6 +513,85 @@ func fetch(url string) (map[string]map[string]float64, error) {
 	}
 
 	return data, nil
+}
+
+func (c *collector) fetchSparkJobStat(server string, app SparkApp) (*StreamingStats, error) {
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	url := server + "/proxy/" + app.Id + streamingStatsEndpoint
+
+	//var tbatch_pattern =`Completed Batches.*?out of (\d+)`
+	//timeout := 30000 * time.Millisecond
+
+	//client := httpclient.NewClient(httpclient.WithHTTPTimeout(timeout))
+	resp, err := c.client.Get(url)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, errors.New("unexpected HTTP status: " + string(resp.StatusCode))
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+
+	if isdebug {
+		log.Printf("[1]Allocated memory: %fMB. Number of goroutines: %d", float32(mem.Alloc)/1024.0/1024.0, runtime.NumGoroutine())
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	var data StreamingStats
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+
+	if err != nil {
+		return nil, err
+	}
+
+	complete_batches := strings.TrimSpace(doc.Find("h4#completed").Text())
+	r := regexp.MustCompile("out of (\\d+)")
+	tmp := r.FindAllString(complete_batches, -1)
+
+	if len(tmp) > 0 {
+		data.CompletedBaches, _ = strconv.ParseInt(strings.TrimSpace(strings.Replace(tmp[0], "out of ", "", -1)), 10, 64)
+	}
+
+	// Find completed-batches table
+	doc.Find("table#completed-batches-table").Each(func(index int, tablehtml *goquery.Selection) {
+		rowhtml := tablehtml.Find("tr:first-of-type")
+		rowhtml.Find("td").Each(func(indexth int, tablecell *goquery.Selection) {
+
+			if batch_id, ok := tablecell.Attr("id"); ok {
+				data.LastBatchID = batch_id
+			}
+
+			val := strings.Split(strings.TrimSpace(tablecell.Text()), " ")[0]
+			if indexth == 1 {
+				data.BatchInput, _ = strconv.ParseInt(val, 10, 64)
+			}
+			if indexth == 3 {
+				data.BatchDuration, _ = strconv.ParseInt(val, 10, 64)
+			}
+
+			//fmt.Println(strings.Split(strings.TrimSpace(tablecell.Text())," ")[0])
+		})
+
+	})
+
+	if isdebug {
+		log.Printf("[2]Allocated memory: %fMB. Number of goroutines: %d", float32(mem.Alloc)/1024.0/1024.0, runtime.NumGoroutine())
+	}
+
+	data.App = &app
+	return &data, nil
 }
 
 func (c *collector) resetMetrics() {
