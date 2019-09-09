@@ -31,12 +31,12 @@ var (
 	storms   string
 	memlimit uint64
 	isdebug  bool
-	dummy bool
+	dummy    bool
 )
 
 func prog(state overseer.State) {
 
-	log.Println("yarn-storm-exporter v1.0 by chinhnc")
+	log.Println("yarn-storm-exporter v2.0 by chinhnc")
 	flag.IntVar(&port, "port", 9653, "The port to serve the endpoint from.")
 	flag.StringVar(&yarns, "yarn.servers", "", "Comma separated list of yarn yarnServers in the format http://host:port")
 	flag.StringVar(&storms, "storm.servers", "", "Comma separated list of storm yarnServers in the format http://host:port")
@@ -52,7 +52,6 @@ func prog(state overseer.State) {
 
 	c := YarnCollector(client, yarns, storms)
 	prometheus.MustRegister(c)
-
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)

@@ -388,6 +388,7 @@ func (c *collector) scrape() {
 
 			if e != nil {
 				c.Lock()
+				log.Println(e)
 				c.appMetrics[server].With(prometheus.Labels{"storm_instance": server, "metric": "up"}).Set(0)
 				c.Unlock()
 				continue
@@ -433,8 +434,7 @@ func (c *collector) scrape() {
 
 }
 
-func
-fetchSparkJobs(body []byte) ([]SparkApp, error) {
+func fetchSparkJobs(body []byte) ([]SparkApp, error) {
 	var p SparkJson
 	err := json.Unmarshal(body, &p)
 	if err != nil {
@@ -445,8 +445,7 @@ fetchSparkJobs(body []byte) ([]SparkApp, error) {
 	return p.Apps.SparkApps, nil
 }
 
-func
-fetchStormJobs(body []byte) ([]StormApp, error) {
+func fetchStormJobs(body []byte) ([]StormApp, error) {
 	var p StormJson
 	err := json.Unmarshal(body, &p)
 	if err != nil {

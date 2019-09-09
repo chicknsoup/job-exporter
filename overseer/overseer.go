@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"time"
 
-	"node_exporter/overseer/fetcher"
+	"job-exporter/overseer/fetcher"
 )
 
 const (
