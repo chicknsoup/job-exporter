@@ -43,11 +43,13 @@ type SparkApp struct {
 }
 
 type StreamingStats struct {
-	App             *SparkApp
-	CompletedBaches int64
-	LastBatchID     string
-	BatchInput      int64
-	BatchDuration   int64
+	App                  *SparkApp
+	CompletedBaches      int64
+	LastBatchID          string
+	BatchInput           int64
+	BatchSchedulingDelay int64
+	BatchProcessingTime  int64
+	BatchTotalDelay      int64
 }
 
 type StormJson struct {
@@ -356,7 +358,9 @@ func (c *collector) scrape() {
 					if res != nil {
 						c.Lock()
 						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "last_streaming_batch_input"}).Set(float64(res.BatchInput))
-						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "last_streaming_batch_duration_seconds"}).Set(float64(res.BatchDuration))
+						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "last_streaming_batch_scheduling_delay_seconds"}).Set(float64(res.BatchSchedulingDelay))
+						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "last_streaming_batch_duration_seconds"}).Set(float64(res.BatchProcessingTime))
+						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "last_streaming_batch_total_delay_seconds"}).Set(float64(res.BatchTotalDelay))
 						c.appMetrics[res.App.Id].With(prometheus.Labels{"id": res.App.Id, "user": res.App.User, "name": res.App.Name, "queue": res.App.Queue, "amhosthttpaddress": res.App.AMHostAddress, "yarn_instance": server, "metric": "total_completed_batches"}).Set(float64(res.CompletedBaches))
 
 						c.Unlock()
@@ -572,12 +576,38 @@ func (c *collector) fetchSparkJobStat(server string, app SparkApp) (*StreamingSt
 				data.LastBatchID = batch_id
 			}
 
-			val := strings.Split(strings.TrimSpace(tablecell.Text()), " ")[0]
-			if indexth == 1 {
+			cellContent := tablecell.Text()
+
+			var timeValue int64
+
+			if (strings.Contains(cellContent, " s")) {
+				timeValue = 1
+			}
+			if (strings.Contains(cellContent, " min")) {
+				timeValue = 60
+			}
+			if (strings.Contains(cellContent, " hour")) {
+				timeValue = 60 * 60
+			}
+			if (strings.Contains(cellContent, " day")) {
+				timeValue = 60 * 60 * 24
+			}
+			val := strings.Split(strings.TrimSpace(cellContent), " ")[0]
+			if indexth == 1 { //number of events
+
 				data.BatchInput, _ = strconv.ParseInt(val, 10, 64)
 			}
-			if indexth == 3 {
-				data.BatchDuration, _ = strconv.ParseInt(val, 10, 64)
+			if indexth == 2 { //scheduling delay
+				data.BatchSchedulingDelay, _ = strconv.ParseInt(val, 10, 64)
+				data.BatchSchedulingDelay = data.BatchSchedulingDelay * timeValue
+			}
+			if indexth == 3 { //processing time
+				data.BatchProcessingTime, _ = strconv.ParseInt(val, 10, 64)
+				data.BatchProcessingTime = data.BatchProcessingTime * timeValue
+			}
+			if indexth == 4 { //total delay
+				data.BatchTotalDelay, _ = strconv.ParseInt(val, 10, 64)
+				data.BatchTotalDelay = data.BatchTotalDelay * timeValue
 			}
 
 			//fmt.Println(strings.Split(strings.TrimSpace(tablecell.Text())," ")[0])

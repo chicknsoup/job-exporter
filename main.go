@@ -36,7 +36,7 @@ var (
 
 func prog(state overseer.State) {
 
-	log.Println("yarn-storm-exporter v2.0 by chinhnc")
+	log.Println("yarn-storm-exporter v2.1 by chinhnc. Build: 19092019")
 	flag.IntVar(&port, "port", 9653, "The port to serve the endpoint from.")
 	flag.StringVar(&yarns, "yarn.servers", "", "Comma separated list of yarn yarnServers in the format http://host:port")
 	flag.StringVar(&storms, "storm.servers", "", "Comma separated list of storm yarnServers in the format http://host:port")
